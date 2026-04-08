@@ -106,6 +106,7 @@ export default function App() {
   const [currentTrack, setCurrentTrack] = useState<MediaFile | null>(null);
   const [isPlaying, setIsPlaying] = useState(false);
   const [volume, setVolume] = useState(80);
+  const [lastVolume, setLastVolume] = useState(80);
   const [currentTime, setCurrentTime] = useState(0);
   const [duration, setDuration] = useState(0);
   const [playlists, setPlaylists] = useState<Playlist[]>([]);
@@ -306,6 +307,8 @@ export default function App() {
     if (isNaN(value) || !isFinite(value)) return;
     
     setVolume(value);
+    if (value > 0) setLastVolume(value);
+    
     const normalizedVolume = Math.max(0, Math.min(1, value / 100));
     
     // Update both refs to ensure volume is synced across audio/video
@@ -314,6 +317,15 @@ export default function App() {
     }
     if (videoRef.current) {
       videoRef.current.volume = normalizedVolume;
+    }
+  };
+
+  const toggleMute = () => {
+    if (volume > 0) {
+      setLastVolume(volume);
+      handleVolumeChange(0);
+    } else {
+      handleVolumeChange(lastVolume || 80);
     }
   };
 
@@ -401,82 +413,201 @@ export default function App() {
       video.muted = true;
       video.playsInline = true;
 
+      const cleanup = () => {
+        URL.revokeObjectURL(video.src);
+        video.onloadedmetadata = null;
+        video.onseeked = null;
+        video.onerror = null;
+      };
+
       video.onloadedmetadata = () => {
-        video.currentTime = Math.min(1, video.duration / 10);
+        if (isFinite(video.duration)) {
+          video.currentTime = Math.min(1, video.duration / 10);
+        } else {
+          video.currentTime = 0;
+        }
       };
 
       video.onseeked = () => {
-        const canvas = document.createElement('canvas');
-        canvas.width = video.videoWidth;
-        canvas.height = video.videoHeight;
-        const ctx = canvas.getContext('2d');
-        if (ctx) {
-          ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-          const thumbnail = canvas.toDataURL('image/jpeg', 0.7);
-          URL.revokeObjectURL(video.src);
-          resolve(thumbnail);
-        } else {
-          URL.revokeObjectURL(video.src);
+        try {
+          const canvas = document.createElement('canvas');
+          canvas.width = video.videoWidth || 320;
+          canvas.height = video.videoHeight || 180;
+          const ctx = canvas.getContext('2d');
+          if (ctx && canvas.width > 0 && canvas.height > 0) {
+            ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+            const thumbnail = canvas.toDataURL('image/jpeg', 0.6);
+            cleanup();
+            resolve(thumbnail);
+          } else {
+            cleanup();
+            resolve(undefined);
+          }
+        } catch (e) {
+          cleanup();
           resolve(undefined);
         }
       };
 
       video.onerror = () => {
-        URL.revokeObjectURL(video.src);
+        cleanup();
         resolve(undefined);
       };
+
+      // Safety timeout
+      setTimeout(() => {
+        cleanup();
+        resolve(undefined);
+      }, 5000);
     });
+  };
+
+  const processFiles = async (files: File[]) => {
+    const newFiles: MediaFile[] = [];
+    const total = files.length;
+    
+    const toastId = toast.loading(`Processing ${total} files...`);
+
+    for (const file of files) {
+      const isAudio = file.type.startsWith('audio/');
+      const isVideo = file.type.startsWith('video/');
+
+      if (isAudio || isVideo) {
+        try {
+          const url = URL.createObjectURL(file);
+          const media = document.createElement(isAudio ? 'audio' : 'video');
+          media.src = url;
+          
+          const thumbnail = isVideo ? await Promise.race([
+            generateThumbnail(file),
+            new Promise<undefined>((resolve) => setTimeout(() => resolve(undefined), 4000))
+          ]) : undefined;
+
+          await Promise.race([
+            new Promise((resolve) => {
+              media.onloadedmetadata = () => {
+                newFiles.push({
+                  title: file.name.replace(/\.[^/.]+$/, ""),
+                  artist: 'Unknown Artist',
+                  album: 'Unknown Album',
+                  duration: isFinite(media.duration) ? media.duration : 0,
+                  fileName: file.name,
+                  fileSize: file.size,
+                  type: isAudio ? 'audio' : 'video',
+                  addedAt: new Date(),
+                  blob: file,
+                  thumbnail
+                });
+                URL.revokeObjectURL(url);
+                resolve(null);
+              };
+              media.onerror = () => {
+                URL.revokeObjectURL(url);
+                resolve(null);
+              };
+            }),
+            new Promise((resolve) => setTimeout(() => {
+              // Fallback if metadata fails
+              newFiles.push({
+                title: file.name.replace(/\.[^/.]+$/, ""),
+                artist: 'Unknown Artist',
+                album: 'Unknown Album',
+                duration: 0,
+                fileName: file.name,
+                fileSize: file.size,
+                type: isAudio ? 'audio' : 'video',
+                addedAt: new Date(),
+                blob: file,
+                thumbnail
+              });
+              URL.revokeObjectURL(url);
+              resolve(null);
+            }, 6000))
+          ]);
+        } catch (err) {
+          console.error("Error processing file:", file.name, err);
+        }
+      }
+    }
+
+    if (newFiles.length > 0) {
+      try {
+        await dbLocal.mediaFiles.bulkAdd(newFiles);
+        toast.success(`Added ${newFiles.length} files to library`, { id: toastId });
+      } catch (error) {
+        console.error("Bulk add error:", error);
+        toast.error("Failed to save some files", { id: toastId });
+      }
+    } else {
+      toast.dismiss(toastId);
+    }
   };
 
   const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const files = e.target.files;
     if (!files) return;
+    await processFiles(Array.from(files));
+    if (e.target) e.target.value = '';
+  };
 
-    const newFiles: MediaFile[] = [];
-    for (let i = 0; i < files.length; i++) {
-      const file = files[i];
-      const isAudio = file.type.startsWith('audio/');
-      const isVideo = file.type.startsWith('video/');
+  const handleFolderPicker = async () => {
+    const useFallback = () => {
+      const input = document.createElement('input');
+      input.type = 'file';
+      (input as any).webkitdirectory = true;
+      input.onchange = async (e: any) => {
+        const files = Array.from(e.target.files as FileList);
+        const mediaFiles = files.filter(f => f.type.startsWith('audio/') || f.type.startsWith('video/'));
+        if (mediaFiles.length > 0) {
+          await processFiles(mediaFiles);
+        } else {
+          toast.info("No supported media files found");
+        }
+      };
+      input.click();
+    };
 
-      if (isAudio || isVideo) {
-        const url = URL.createObjectURL(file);
-        const media = document.createElement(isAudio ? 'audio' : 'video');
-        media.src = url;
-        
-        const thumbnail = isVideo ? await generateThumbnail(file) : undefined;
-
-        await new Promise((resolve) => {
-          media.onloadedmetadata = () => {
-            newFiles.push({
-              title: file.name.replace(/\.[^/.]+$/, ""),
-              artist: 'Unknown Artist',
-              album: 'Unknown Album',
-              duration: media.duration,
-              fileName: file.name,
-              fileSize: file.size,
-              type: isAudio ? 'audio' : 'video',
-              addedAt: new Date(),
-              blob: file,
-              thumbnail
-            });
-            URL.revokeObjectURL(url);
-            resolve(null);
-          };
-          media.onerror = () => {
-            URL.revokeObjectURL(url);
-            resolve(null);
-          };
-        });
+    try {
+      // showDirectoryPicker is often blocked in cross-origin iframes (like AI Studio preview)
+      // We check if we're in an iframe or just try-catch the specific error
+      if (window.self !== window.top || !('showDirectoryPicker' in window)) {
+        useFallback();
+        return;
       }
-    }
 
-    if (newFiles.length > 0) {
-      await dbLocal.mediaFiles.bulkAdd(newFiles);
-      toast.success(`Added ${newFiles.length} files to library`);
-    }
-    
-    if (e.target) {
-      e.target.value = '';
+      const directoryHandle = await (window as any).showDirectoryPicker();
+      const files: File[] = [];
+      
+      async function scanDirectory(handle: any) {
+        for await (const entry of handle.values()) {
+          if (entry.kind === 'file') {
+            const file = await entry.getFile();
+            if (file.type.startsWith('audio/') || file.type.startsWith('video/')) {
+              files.push(file);
+            }
+          } else if (entry.kind === 'directory') {
+            await scanDirectory(entry);
+          }
+        }
+      }
+      
+      const scanToastId = toast.loading("Scanning folder...");
+      await scanDirectory(directoryHandle);
+      toast.dismiss(scanToastId);
+      
+      if (files.length > 0) {
+        await processFiles(files);
+      } else {
+        toast.info("No supported media files found in folder");
+      }
+    } catch (error) {
+      if ((error as Error).name === 'SecurityError' || (error as Error).message.includes('sub frames')) {
+        console.warn("showDirectoryPicker blocked in iframe, using fallback");
+        useFallback();
+      } else if ((error as Error).name !== 'AbortError') {
+        console.error("Folder picker error:", error);
+        toast.error("Failed to access folder");
+      }
     }
   };
 
@@ -700,12 +831,28 @@ export default function App() {
               <Plus className="w-4 h-4" /> Add Files
             </Button>
             <Button 
+              variant="outline" 
+              size="sm" 
+              className="gap-2 hidden sm:flex"
+              onClick={handleFolderPicker}
+            >
+              <FolderOpen className="w-4 h-4" /> Add Folder
+            </Button>
+            <Button 
               variant="ghost" 
               size="icon" 
               className="sm:hidden"
               onClick={() => fileInputRef.current?.click()}
             >
               <Plus className="w-5 h-5" />
+            </Button>
+            <Button 
+              variant="ghost" 
+              size="icon" 
+              className="sm:hidden"
+              onClick={handleFolderPicker}
+            >
+              <FolderOpen className="w-5 h-5" />
             </Button>
           </div>
         </header>
@@ -808,12 +955,24 @@ export default function App() {
 
                 {activeTab === 'videos' && videoSubTab === 'folder' && (
                   <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 gap-6">
-                    <div className="flex flex-col items-center gap-2 cursor-pointer group">
+                    <div 
+                      className="flex flex-col items-center gap-2 cursor-pointer group"
+                      onClick={handleFolderPicker}
+                    >
                       <div className="w-full aspect-square bg-white/5 rounded-2xl flex items-center justify-center group-hover:bg-white/10 transition-colors relative">
                         <FolderOpen className="w-12 h-12 text-orange-500" />
-                        <div className="absolute top-2 right-2 bg-blue-500 rounded-full p-1">
-                          <Download className="w-3 h-3 text-white" />
+                        <div className="absolute top-2 right-2 bg-orange-500 rounded-full p-1">
+                          <Plus className="w-3 h-3 text-black" />
                         </div>
+                      </div>
+                      <div className="text-center">
+                        <p className="font-medium text-sm">Scan Folder</p>
+                        <p className="text-[10px] text-white/40">Add all videos from a folder</p>
+                      </div>
+                    </div>
+                    <div className="flex flex-col items-center gap-2 cursor-pointer group">
+                      <div className="w-full aspect-square bg-white/5 rounded-2xl flex items-center justify-center group-hover:bg-white/10 transition-colors relative">
+                        <FolderOpen className="w-12 h-12 text-orange-500/50" />
                       </div>
                       <div className="text-center">
                         <p className="font-medium text-sm">Download</p>
@@ -1148,7 +1307,7 @@ export default function App() {
               )}>
                 <div className="space-y-4 max-w-6xl mx-auto">
                   <div className="flex items-center gap-3 px-2">
-                    <span className="text-[10px] sm:text-xs font-mono text-white/70">
+                    <span className="text-[10px] sm:text-xs font-mono text-white/70 w-10 text-right">
                       {Math.floor(currentTime / 60)}:{Math.floor(currentTime % 60).toString().padStart(2, '0')}
                     </span>
                     <Slider 
@@ -1160,22 +1319,43 @@ export default function App() {
                       onValueCommitted={handleSeekCommit}
                       className="flex-1"
                     />
-                    <span className="text-[10px] sm:text-xs font-mono text-white/70">
-                      -{Math.floor((duration - currentTime) / 60)}:{Math.floor((duration - currentTime) % 60).toString().padStart(2, '0')}
+                    <span className="text-[10px] sm:text-xs font-mono text-white/70 w-10">
+                      {Math.floor(duration / 60)}:{Math.floor(duration % 60).toString().padStart(2, '0')}
                     </span>
                   </div>
                   
                   <div className="flex items-center justify-between">
-                    <div className="flex items-center gap-4 sm:gap-8">
-                      <Button variant="ghost" size="icon" className="text-white h-12 w-12" onClick={() => setIsPlaying(!isPlaying)}>
-                        {isPlaying ? <Pause className="w-8 h-8 fill-current" /> : <Play className="w-8 h-8 fill-current ml-1" />}
+                    <div className="flex items-center gap-3 sm:gap-8">
+                      <Button 
+                        size="icon" 
+                        className="w-12 h-12 sm:w-16 sm:h-16 bg-white text-black hover:bg-white/90 rounded-full shadow-xl flex items-center justify-center shrink-0" 
+                        onClick={() => setIsPlaying(!isPlaying)}
+                      >
+                        {isPlaying ? <Pause className="w-6 h-6 sm:w-8 sm:h-8 fill-current" /> : <Play className="w-6 h-6 sm:w-8 sm:h-8 fill-current ml-1" />}
                       </Button>
-                      <Button variant="ghost" size="icon" className="text-white h-10 w-10" onClick={playPrevious}>
-                        <SkipBack className="w-6 h-6 fill-current" />
+                      <Button variant="ghost" size="icon" className="text-white h-10 w-10 sm:h-12 sm:w-12" onClick={playPrevious}>
+                        <SkipBack className="w-5 h-5 sm:w-7 sm:h-7 fill-current" />
                       </Button>
-                      <Button variant="ghost" size="icon" className="text-white h-10 w-10" onClick={playNext}>
-                        <SkipForward className="w-6 h-6 fill-current" />
+                      <Button variant="ghost" size="icon" className="text-white h-10 w-10 sm:h-12 sm:w-12" onClick={playNext}>
+                        <SkipForward className="w-5 h-5 sm:w-7 sm:h-7 fill-current" />
                       </Button>
+                      <div className="flex items-center gap-2 w-24 sm:w-32 ml-2 sm:ml-4">
+                        <Button 
+                          variant="ghost" 
+                          size="icon" 
+                          className="h-8 w-8 text-white/70 hover:text-white p-0"
+                          onClick={toggleMute}
+                        >
+                          {volume === 0 ? <VolumeX className="w-4 h-4" /> : <Volume2 className="w-4 h-4" />}
+                        </Button>
+                        <Slider 
+                          value={[volume]} 
+                          max={100} 
+                          variant="green"
+                          onValueChange={handleVolumeChange}
+                          className="flex-1"
+                        />
+                      </div>
                     </div>
 
                     <div className="flex items-center gap-2 sm:gap-6">
@@ -1268,11 +1448,11 @@ export default function App() {
               </Button>
               <Button 
                 size="icon" 
-                className="w-8 h-8 lg:w-10 lg:h-10 bg-white text-black hover:bg-white/90 rounded-full"
+                className="w-10 h-10 lg:w-12 lg:h-12 bg-white text-black hover:bg-white/90 rounded-full shadow-md flex items-center justify-center shrink-0"
                 onClick={() => setIsPlaying(!isPlaying)}
                 disabled={!currentTrack}
               >
-                {isPlaying ? <Pause className="w-4 h-4 lg:w-5 lg:h-5 fill-current" /> : <Play className="w-4 h-4 lg:w-5 lg:h-5 fill-current ml-0.5 lg:ml-1" />}
+                {isPlaying ? <Pause className="w-5 h-5 lg:w-6 lg:h-6 fill-current" /> : <Play className="w-5 h-5 lg:w-6 lg:h-6 fill-current ml-0.5 lg:ml-1" />}
               </Button>
               <Button 
                 variant="ghost" 
@@ -1304,15 +1484,32 @@ export default function App() {
           </div>
 
           {/* Mobile Mini Controls */}
-          <div className="flex sm:hidden items-center gap-2 ml-auto">
+          <div className="flex sm:hidden items-center gap-1 ml-auto">
             <Button 
               variant="ghost" 
               size="icon" 
-              className="text-white"
+              className="text-white/70"
+              onClick={playPrevious}
+              disabled={!currentTrack}
+            >
+              <SkipBack className="w-5 h-5 fill-current" />
+            </Button>
+            <Button 
+              size="icon" 
+              className="w-10 h-10 bg-white text-black hover:bg-white/90 rounded-full shadow-lg flex items-center justify-center shrink-0"
               onClick={() => setIsPlaying(!isPlaying)}
               disabled={!currentTrack}
             >
-              {isPlaying ? <Pause className="w-6 h-6 fill-current" /> : <Play className="w-6 h-6 fill-current ml-0.5" />}
+              {isPlaying ? <Pause className="w-5 h-5 fill-current" /> : <Play className="w-5 h-5 fill-current ml-0.5" />}
+            </Button>
+            <Button 
+              variant="ghost" 
+              size="icon" 
+              className="text-white/70"
+              onClick={playNext}
+              disabled={!currentTrack}
+            >
+              <SkipForward className="w-5 h-5 fill-current" />
             </Button>
             <Button 
               variant="ghost" 
@@ -1324,9 +1521,16 @@ export default function App() {
             </Button>
           </div>
 
-          <div className="w-1/4 hidden lg:flex items-center justify-end gap-4">
+          <div className="w-1/4 hidden md:flex items-center justify-end gap-4">
             <div className="flex items-center gap-2 w-32">
-              {volume === 0 ? <VolumeX className="w-4 h-4 text-white/40" /> : <Volume2 className="w-4 h-4 text-white/40" />}
+              <Button 
+                variant="ghost" 
+                size="icon" 
+                className="h-8 w-8 text-white/40 hover:text-white p-0"
+                onClick={toggleMute}
+              >
+                {volume === 0 ? <VolumeX className="w-4 h-4" /> : <Volume2 className="w-4 h-4" />}
+              </Button>
               <Slider 
                 value={[volume]} 
                 max={100} 
@@ -1399,7 +1603,10 @@ export default function App() {
                 </motion.div>
 
                 <div className="w-full space-y-8">
-                  <div className="space-y-2">
+                  <div className="flex items-center gap-3 w-full">
+                    <span className="text-xs text-white/40 font-mono shrink-0 w-10 text-right">
+                      {Math.floor(currentTime / 60)}:{Math.floor(currentTime % 60).toString().padStart(2, '0')}
+                    </span>
                     <Slider 
                       value={[currentTime]} 
                       max={duration || 100} 
@@ -1407,12 +1614,11 @@ export default function App() {
                       variant="orange"
                       onValueChange={handleSeek}
                       onValueCommitted={handleSeekCommit}
-                      className="w-full"
+                      className="flex-1"
                     />
-                    <div className="flex justify-between text-xs text-white/40 font-mono">
-                      <span>{Math.floor(currentTime / 60)}:{Math.floor(currentTime % 60).toString().padStart(2, '0')}</span>
-                      <span>{Math.floor(duration / 60)}:{Math.floor(duration % 60).toString().padStart(2, '0')}</span>
-                    </div>
+                    <span className="text-xs text-white/40 font-mono shrink-0 w-10">
+                      {Math.floor(duration / 60)}:{Math.floor(duration % 60).toString().padStart(2, '0')}
+                    </span>
                   </div>
 
                   <div className="flex items-center justify-between px-4 w-full max-w-md mx-auto">
@@ -1463,7 +1669,14 @@ export default function App() {
                   </div>
 
                   <div className="flex items-center gap-4 max-w-xs mx-auto pt-4">
-                    {volume === 0 ? <VolumeX className="w-4 h-4 text-white/30" /> : <Volume2 className="w-4 h-4 text-white/30" />}
+                    <Button 
+                      variant="ghost" 
+                      size="icon" 
+                      className="h-8 w-8 text-white/30 hover:text-white p-0"
+                      onClick={toggleMute}
+                    >
+                      {volume === 0 ? <VolumeX className="w-4 h-4" /> : <Volume2 className="w-4 h-4" />}
+                    </Button>
                     <Slider 
                       value={[volume]} 
                       max={100} 
