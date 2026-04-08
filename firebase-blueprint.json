@@ -1,0 +1,52 @@
+{
+  "entities": {
+    "Playlist": {
+      "title": "Playlist",
+      "description": "A collection of tracks synced across devices.",
+      "type": "object",
+      "properties": {
+        "name": { "type": "string", "description": "Name of the playlist" },
+        "description": { "type": "string", "description": "Description of the playlist" },
+        "ownerId": { "type": "string", "description": "Firebase UID of the owner" },
+        "createdAt": { "type": "string", "format": "date-time", "description": "Creation timestamp" },
+        "tracks": {
+          "type": "array",
+          "description": "List of track metadata",
+          "items": {
+            "type": "object",
+            "properties": {
+              "title": { "type": "string" },
+              "artist": { "type": "string" },
+              "album": { "type": "string" },
+              "duration": { "type": "number" },
+              "fileName": { "type": "string" },
+              "fileSize": { "type": "number" },
+              "type": { "type": "string", "enum": ["audio", "video"] }
+            }
+          }
+        }
+      },
+      "required": ["name", "ownerId", "tracks"]
+    },
+    "UserProfile": {
+      "title": "User Profile",
+      "description": "User specific settings and metadata.",
+      "type": "object",
+      "properties": {
+        "email": { "type": "string" },
+        "displayName": { "type": "string" },
+        "lastSync": { "type": "string", "format": "date-time" }
+      }
+    }
+  },
+  "firestore": {
+    "/playlists/{playlistId}": {
+      "schema": "Playlist",
+      "description": "User playlists"
+    },
+    "/users/{userId}": {
+      "schema": "UserProfile",
+      "description": "User profile data"
+    }
+  }
+}

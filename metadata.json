@@ -1,0 +1,5 @@
+{
+  "name": "VibeSync",
+  "description": "A full-stack music and video player with offline support, local file access, and cross-device playlist syncing.",
+  "requestFramePermissions": []
+}
