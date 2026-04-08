@@ -100,6 +100,11 @@ async function testConnection() {
 testConnection();
 
 export default function App() {
+  const localPlaylists = useLiveQuery(
+    () => dbLocal.playlists.toArray(),
+    []
+  );
+
   const [user, setUser] = useState<FirebaseUser | null>(null);
   const [activeTab, setActiveTab] = useState('music');
   const [searchQuery, setSearchQuery] = useState('');
@@ -638,39 +643,71 @@ export default function App() {
     }
 
     try {
-      await addDoc(collection(firestore, 'playlists'), {
+      // Save locally first for offline support
+      const localId = await dbLocal.playlists.add({
         name: newPlaylistName.trim(),
-        ownerId: user.uid,
-        tracks: [],
-        createdAt: serverTimestamp()
+        ownerId: user?.uid,
+        trackIds: [],
+        createdAt: new Date()
       });
+
+      // Try to sync with Firestore if online
+      if (user) {
+        try {
+          const docRef = await addDoc(collection(firestore, 'playlists'), {
+            name: newPlaylistName.trim(),
+            ownerId: user.uid,
+            tracks: [],
+            createdAt: serverTimestamp()
+          });
+          await dbLocal.playlists.update(localId, { firestoreId: docRef.id });
+        } catch (e) {
+          console.warn("Firestore sync failed, will remain local-only for now", e);
+        }
+      }
+
       toast.success("Playlist created");
       setNewPlaylistName('');
       setIsPlaylistDialogOpen(false);
     } catch (e) {
-      handleFirestoreError(e, OperationType.CREATE, 'playlists');
+      console.error("Failed to create local playlist:", e);
+      toast.error("Failed to create playlist");
     }
   };
 
-  const addToPlaylist = async (playlistId: string, track: MediaFile) => {
-    if (!user) return;
-
-    const trackData = {
-      title: track.title,
-      artist: track.artist,
-      fileName: track.fileName,
-      fileSize: track.fileSize,
-      type: track.type,
-      duration: track.duration
-    };
-
+  const addToPlaylist = async (playlistId: number | string, track: MediaFile) => {
     try {
-      await updateDoc(doc(firestore, 'playlists', playlistId), {
-        tracks: arrayUnion(trackData)
-      });
-      toast.success("Added to playlist");
+      // If playlistId is a number, it's a local ID
+      if (typeof playlistId === 'number') {
+        const playlist = await dbLocal.playlists.get(playlistId);
+        if (playlist && track.id) {
+          const newTrackIds = [...new Set([...playlist.trackIds, track.id])];
+          await dbLocal.playlists.update(playlistId, { trackIds: newTrackIds });
+          
+          // Try to sync with Firestore if it has a firestoreId
+          if (playlist.firestoreId && user) {
+            try {
+              const trackData = {
+                title: track.title,
+                artist: track.artist,
+                fileName: track.fileName,
+                fileSize: track.fileSize,
+                type: track.type,
+                duration: track.duration
+              };
+              await updateDoc(doc(firestore, 'playlists', playlist.firestoreId), {
+                tracks: arrayUnion(trackData)
+              });
+            } catch (e) {
+              console.warn("Firestore sync failed for playlist update", e);
+            }
+          }
+          toast.success("Added to playlist");
+        }
+      }
     } catch (e) {
-      handleFirestoreError(e, OperationType.WRITE, `playlists/${playlistId}`);
+      console.error("Failed to add to playlist:", e);
+      toast.error("Failed to add to playlist");
     }
   };
 
@@ -984,21 +1021,21 @@ export default function App() {
 
                 {activeTab === 'videos' && videoSubTab === 'playlist' && (
                   <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
-                    {playlists.length === 0 ? (
+                    {(!localPlaylists || localPlaylists.length === 0) ? (
                       <div className="col-span-full py-12 text-center bg-white/5 rounded-2xl border border-dashed border-white/10">
                         <ListMusic className="w-12 h-12 text-white/20 mx-auto mb-4" />
                         <p className="text-white/50">No video playlists yet</p>
                         <Button variant="link" className="text-orange-500" onClick={() => setIsPlaylistDialogOpen(true)}>Create one</Button>
                       </div>
                     ) : (
-                      playlists.map(playlist => (
+                      localPlaylists.map(playlist => (
                         <div key={playlist.id} className="p-4 bg-white/5 rounded-xl flex items-center gap-4 hover:bg-white/10 transition-colors cursor-pointer">
                           <div className="w-16 h-16 bg-orange-500/20 rounded-lg flex items-center justify-center">
                             <ListMusic className="w-8 h-8 text-orange-500" />
                           </div>
                           <div>
                             <h4 className="font-bold">{playlist.name}</h4>
-                            <p className="text-xs text-white/40">{playlist.tracks.filter(t => t.type === 'video').length} videos</p>
+                            <p className="text-xs text-white/40">{playlist.trackIds.length} videos</p>
                           </div>
                         </div>
                       ))
@@ -1074,8 +1111,8 @@ export default function App() {
                                   <DropdownMenuItem onClick={() => dbLocal.mediaFiles.delete(file.id!)}>
                                     <Trash2 className="w-4 h-4 mr-2" /> Remove
                                   </DropdownMenuItem>
-                                  {playlists.map(p => (
-                                    <DropdownMenuItem key={p.id} onClick={() => addToPlaylist(p.id, file)}>
+                                  {localPlaylists?.map(p => (
+                                    <DropdownMenuItem key={p.id} onClick={() => addToPlaylist(p.id!, file)}>
                                       <Plus className="w-4 h-4 mr-2" /> Add to {p.name}
                                     </DropdownMenuItem>
                                   ))}
@@ -1116,36 +1153,39 @@ export default function App() {
                   </Button>
                 </div>
 
-                {!user && (
+                {(!localPlaylists || localPlaylists.length === 0) && (
                   <div className="p-12 text-center bg-white/5 rounded-2xl border border-dashed border-white/10">
-                    <Cloud className="w-12 h-12 text-white/20 mx-auto mb-4" />
-                    <h3 className="text-lg font-medium">Sync your playlists</h3>
-                    <p className="text-white/50 mb-6">Sign in to access your playlists across all your devices.</p>
-                    <Button onClick={loginWithGoogle}>Sign In with Google</Button>
+                    <ListMusic className="w-12 h-12 text-white/20 mx-auto mb-4" />
+                    <h3 className="text-lg font-medium">No playlists yet</h3>
+                    <p className="text-white/50 mb-6">Create a playlist to organize your music and videos offline.</p>
+                    <Button onClick={() => setIsPlaylistDialogOpen(true)}>Create Playlist</Button>
                   </div>
                 )}
 
                 <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
-                  {playlists.map(playlist => (
+                  {localPlaylists?.map(playlist => (
                     <div key={playlist.id} className="p-6 rounded-2xl bg-white/5 border border-white/10 hover:border-orange-500/50 transition-colors group">
                       <div className="flex justify-between items-start mb-4">
                         <div>
                           <h3 className="text-xl font-bold">{playlist.name}</h3>
-                          <p className="text-sm text-white/50">{playlist.tracks.length} tracks</p>
+                          <p className="text-sm text-white/50">{playlist.trackIds.length} tracks</p>
                         </div>
-                        <Button variant="ghost" size="icon" onClick={() => deleteDoc(doc(firestore, 'playlists', playlist.id))}>
+                        <Button variant="ghost" size="icon" onClick={() => dbLocal.playlists.delete(playlist.id!)}>
                           <Trash2 className="w-4 h-4 text-white/30 hover:text-red-500" />
                         </Button>
                       </div>
                       <div className="space-y-2">
-                        {playlist.tracks.slice(0, 3).map((t, i) => (
-                          <div key={i} className="text-sm text-white/40 truncate flex items-center gap-2">
-                            <div className="w-1 h-1 bg-white/20 rounded-full" />
-                            {t.title}
-                          </div>
-                        ))}
-                        {playlist.tracks.length > 3 && (
-                          <p className="text-xs text-white/20">+{playlist.tracks.length - 3} more</p>
+                        {playlist.trackIds.slice(0, 3).map((tid, i) => {
+                          const track = localLibrary?.find(f => f.id === tid);
+                          return (
+                            <div key={i} className="text-sm text-white/40 truncate flex items-center gap-2">
+                              <div className="w-1 h-1 bg-white/20 rounded-full" />
+                              {track?.title || 'Unknown Track'}
+                            </div>
+                          );
+                        })}
+                        {playlist.trackIds.length > 3 && (
+                          <p className="text-xs text-white/20">+{playlist.trackIds.length - 3} more</p>
                         )}
                       </div>
                       <Button variant="secondary" className="w-full mt-6 opacity-0 group-hover:opacity-100 transition-opacity">
